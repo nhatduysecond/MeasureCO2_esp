@@ -1,0 +1,545 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <LiquidCrystal_I2C.h>
+#include <MQ135.h>
+#include <time.h>
+#include <SoftwareSerial.h>
+#include <SdsDustSensor.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
+#include <Firebase.h>
+
+#define machinePin D0 //chân ra quạt
+#define DHTTYPE DHT21
+#define DHTPIN D6
+#define FIREBASE_HOST "https://smart-parking-tunnel-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define FIREBASE_API "AIzaSyB85wECEH5JMBSR5xRka8rWZZbGtUvh2H4"
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+LiquidCrystal_I2C lcd(0x3F,16,2);
+MQ135 mq135_sensor = MQ135(A0); //chân vào analog cảm biến đo nồng độ khí
+//SoftwareSerial s(D7, D8); //RX TX
+SdsDustSensor sds(7, 8);
+DHT dht(DHTPIN,DHTTYPE);
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+int updateCheck = 0;
+
+const char* ssid="nhatrovn.vn CN31"; //tên wifi
+const char* pass="nhatrovn.vn"; //mật khẩu wifi
+const char* mqtt_server = "broker.hivemq.com"; //server MQTT
+const int mqtt_port = 1883; //port server MQTT
+const String currentVersion = "1.7";
+const char* serverUrl = "http://robot-kambria.000webhostapp.com";
+
+int stateManual; //bien chế độ - 0: manual và 1 : auto
+int stateLight = 0; //bien đèn 1 - ON và 0 - OFF
+int stateMachine = 0; //bien quạt 1 - ON và 0 - OFF
+int valuePPM=800;
+String c;
+String strTopic;
+unsigned long time_1=0;
+unsigned long time_2=0;
+
+void callback(char* topic, byte* payload, unsigned int length);
+void Wifi();
+void MQTT();
+void mode(int numMode);
+void Manual();
+void pubStateNow();
+int getCO2();
+void Auto();
+void ScrollDisplayLCD(int length);
+void controlLight();
+void clearLcdLine(int line);
+void updateFirmware();
+void getInfoUpdate();
+//void getPM();
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(machinePin,OUTPUT);
+    pinMode(D1,SCL); //chân LCD theo I2C
+    pinMode(D2,SDA); //chân LCD theo I2C
+    pinMode(D3,INPUT); //chân vào của cảm biến phát hiện chuyển động
+    pinMode(D4, OUTPUT); //chân ra đèn led
+    pinMode(D5,INPUT); //chân vào cảm biến chuyển động
+    pinMode(D6,INPUT); //chân vào DHT21
+    sds.begin();
+    sds.setActiveReportingMode();
+    sds.setContinuousWorkingPeriod();
+    dht.begin();
+    lcd.init();
+    lcd.backlight();
+    lcd.setContrast(255);
+    lcd.setCursor(0,1);
+    lcd.print("Version: " + currentVersion);
+    delay(5000);
+    lcd.clear();
+    Wifi();
+    client.subscribe("CO2Measurement/mode");
+    client.subscribe("CO2Measurement/machine");
+    client.subscribe("CO2Measurement/stateNow");
+    client.subscribe("CO2Measurement/setPPMAuto");
+    client.subscribe("CO2Measurement/setLight");
+    pubStateNow(); //gửi dữ liệu lúc vừa mở system
+    
+    //firebase
+    config.api_key = FIREBASE_API;
+    config.database_url = FIREBASE_HOST;
+    if (Firebase.signUp(&config,&auth,"",""))
+    {
+        Serial.println("Login to firebase OK");
+    }
+    else
+    {
+        Serial.println("Login to firebase Failed");
+    }
+    Firebase.begin(&config,&auth);
+    Firebase.reconnectWiFi(true);
+    
+    
+}
+void loop()
+{
+    client.loop();
+    if ((unsigned long)(millis()-time_1)>5000)
+    {
+        char buffer[50];
+        sprintf(buffer,"%d",getCO2());
+        client.publish("CO2Measurement/Data",buffer);
+        //getPM(); //lấy giá trị bụi
+        Serial.print(getCO2());
+        Serial.println();
+        pubStateNow();
+        time_1=millis();
+    }
+    updateFirmware();
+}
+
+#pragma region Network
+
+void Wifi()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid,pass);
+    
+    lcd.print("Connecting to");
+    lcd.setCursor(0,1);
+    lcd.print("Wifi");
+    Serial.print("Connecting to Wifi");
+    
+    while (WiFi.status()!=WL_CONNECTED)
+    {
+        lcd.print(".");
+        Serial.print(".");
+        delay(800);
+    }
+    lcd.clear();
+    lcd.setCursor(0,0);
+    lcd.print("Connected to");
+    lcd.setCursor(0,1);
+    lcd.print("Wifi");
+    delay(800);
+    Serial.print("Connected to Wifi");
+    MQTT();
+}
+
+void MQTT()
+{
+    client.setServer(mqtt_server,mqtt_port);
+    client.setCallback(callback);
+    while(!client.connected())
+    {
+        if(client.connect("ESP8266_CO2"))
+        {
+            lcd.clear();
+            lcd.setCursor(0,0);
+            lcd.print("Connected to");
+            lcd.setCursor(0,1);
+            lcd.print("MQTT Broker");
+            Serial.print("Connected to MQTT Broker");
+            //ScrollDisplayLCD(25);
+            delay(500);
+            lcd.clear();
+        }
+        else
+        {
+            lcd.clear();
+            lcd.setCursor(0,0);
+            lcd.print("Failed connect");
+            lcd.setCursor(0,1);
+            lcd.print("to MQTT Broker");
+            Serial.print("failed with state ");
+            Serial.print(client.state());
+            delay(2000);
+        }
+    }
+}
+
+
+#pragma endregion Network
+
+void callback(char* topic, byte* payload, unsigned int length) //ham tra ve data mqtt
+{
+    Serial.print("Message arrived in topic: ");
+    Serial.println(topic);
+    Serial.print("Message:");
+    payload[length]='\0';
+
+    strTopic = String((char*)topic); //topic
+    c=String((char*)payload); //data trong topic
+    Serial.print(c);
+    Serial.println();
+    Serial.print("--------------");
+    if(strTopic=="CO2Measurement/mode") //topic
+    {
+        if(c=="manual")
+        {
+            mode(0);
+        }
+        else if(c=="auto")
+        {
+            mode(1);
+        }
+    }
+    if(strTopic=="CO2Measurement/machine")
+    {
+        //đảo trạng thái biến stateMachine
+        int *temp;
+        temp=&stateMachine;
+        if(c=="on")
+        {
+            *temp=1;
+        }
+        if(c=="off")
+        {
+            *temp=0;
+        }
+        Manual();
+    }
+    if(strTopic=="CO2Measurement/setLight")
+    {
+        //đảo trạng thái biến stateMachine
+        int *temp;
+        temp=&stateLight;
+        if(c=="1")
+        {
+            *temp=1;
+        }
+        if(c=="0")
+        {
+            *temp=0;
+        }
+        Manual();
+    }
+    //hàm gửi trạng thái hiện tại system lúc Desktop vừa mở
+    if(strTopic=="CO2Measurement/stateNow")
+    {
+        if(c=="1")
+        {pubStateNow();}
+    }
+    //hàm set giá trị cho hàm auto
+    if(strTopic=="CO2Measurement/setPPMAuto")
+    {
+        valuePPM= atoi((char*)payload);
+    }
+    /* if(strTopic=="CO2Measurement/setLight")
+    {
+        if(c=="1")
+        {
+            digitalWrite(D4,HIGH);
+        }
+        if(c=="0")
+        {
+            digitalWrite(D4,LOW);
+        }
+    } */
+}
+//hàm gửi trạng thái hiện tại
+void pubStateNow() //ham này khi mo len se gui du lieu len cloud
+{
+    client.publish("CO2Measurement/statusDevice","1");
+    if(getCO2()==0)
+    {
+        client.publish("CO2Measurement/statusSensor","0");
+    }
+    else
+    {
+        client.publish("CO2Measurement/statusSensor","1");
+    }
+    if(stateMachine==1)
+    {
+        client.publish("CO2Measurement/statusMachine","1");
+    }
+    else
+    {
+        client.publish("CO2Measurement/statusMachine","0");
+    }
+    if (stateManual==1)
+    {
+        client.publish("CO2Measurement/statusMode","1");
+    }
+    else
+    {
+        client.publish("CO2Measurement/statusMode","0");
+    }
+    if (stateLight==1)
+    {
+        client.publish("CO2Measurement/statusLight","1");
+    }
+    else
+    {
+        client.publish("CO2Measurement/statusLight","0");
+    }
+    Auto();
+}
+
+void mode(int numMode) //ham lua chon che do, 0: manual; 1: auto
+{
+    //manual
+    if (numMode==0)
+    {
+        //lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("Manual Mode");
+        Serial.print("Manual Mode");
+        stateManual=1;
+        client.publish("CO2Measurement/statusMode","1");
+    }
+    //auto
+    else if (numMode==1)
+    {
+        //lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("Automatic Mode");
+        Serial.print("che do tu dong");
+        client.publish("CO2Measurement/statusMode","0");
+        if(getCO2()>=valuePPM)
+        {
+            digitalWrite(machinePin,HIGH);
+            client.publish("CO2Measurement/statusMachine","1");
+        }
+        else
+        {
+            digitalWrite(machinePin,LOW);
+            client.publish("CO2Measurement/statusMachine","0");
+        }
+        stateManual=0;
+    }
+    Serial.println();
+    Serial.print(numMode);
+    
+}
+
+void Manual() //che do manual
+{
+    if(stateManual==1)
+    {
+        if(stateMachine==1)
+        {
+            digitalWrite(machinePin,HIGH);
+            lcd.setCursor(0,1);
+            lcd.print("Fan:ON ");
+            client.publish("CO2Measurement/statusMachine","1");
+        }
+        if(stateMachine==0)
+        {
+            digitalWrite(machinePin,LOW);
+            lcd.setCursor(0,1);
+            lcd.print("FAN:OFF ");
+            client.publish("CO2Measurement/statusMachine","0");
+        }
+        if(stateLight==1)
+        {
+            digitalWrite(D4,HIGH);
+            lcd.setCursor(8,1);
+            lcd.print("Light:ON");
+            client.publish("CO2Measurement/statusLight","1");
+        }
+        if(stateLight==0)
+        {
+            digitalWrite(D4,LOW);
+            lcd.setCursor(8,1);
+            lcd.print("Light:OFF ");
+            client.publish("CO2Measurement/statusLight","0");
+        }
+    }
+    if(stateManual==0)
+    {
+        //neu khong bat manual ma chinh machine
+    }
+}
+
+void Auto() //che do tu dong
+{
+    if(stateManual==0)
+    {
+        if(getCO2()>=valuePPM)
+            {
+                digitalWrite(machinePin,HIGH);
+                lcd.setCursor(0,1);
+                lcd.print("Fan:ON ");
+                client.publish("CO2Measurement/statusMachine","1");
+            }
+            else
+            {
+                digitalWrite(machinePin,LOW);
+                lcd.setCursor(0,1);
+                lcd.print("Fan:OFF ");
+                client.publish("CO2Measurement/statusMachine","0");
+            }
+        controlLight();
+    PmResult pm = sds.readPm();
+    if(pm.isOk())
+    {
+        if(pm.pm25 >= 51)
+        {
+            digitalWrite(machinePin, HIGH);
+        }
+    }
+    }
+}
+
+int getCO2() //ham tra ve gia tri CO2
+{
+    float ppm;
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    /* if (isnan(h) || isnan(t))
+    {
+        Serial.println("DHT ERROR");
+        clearLcdLine(0);
+        lcd.setCursor(0,0);
+        lcd.print("DHT ERROR");
+    } */
+    ppm = mq135_sensor.getCorrectedPPM(t,h);
+    return (int)ppm;
+}
+
+#pragma region LCD
+
+void ScrollDisplayLCD(int length) //chạy chữ trên LCD
+{
+    for (int i = 0; i < length; i++)
+        {
+            lcd.scrollDisplayLeft();
+            delay(300);
+        }
+}
+
+void clearLcdLine(int line)
+{
+    lcd.setCursor(0,line);
+    for(int n=0;n<16;n++)
+    {
+        lcd.print(" ");
+    }
+}
+#pragma endregion LCD
+//hàm phát hiện chuyển động và bật đèn
+void controlLight()
+{
+    if(digitalRead(D3)==1)
+    {
+        //lcd.clear();
+        lcd.setCursor(8,1);
+        lcd.print("Light:ON");
+        digitalWrite(D4,HIGH);
+    }
+    else{
+        //lcd.clear();
+        lcd.setCursor(8,1);
+        lcd.print("Light:OFF");
+        digitalWrite(D4,LOW);
+    }
+}
+
+void updateFirmware()
+{
+    unsigned long time_2 = 0;
+    if ((unsigned long)(millis()-time_2)>30000)
+    {
+        getInfoUpdate();
+        if(updateCheck == 1)
+        {
+            Firebase.RTDB.setInt(&fbdo,"Update",0);
+            delay(500);
+            t_httpUpdate_return ret = ESPhttpUpdate.update(espClient, serverUrl, currentVersion);
+            switch (ret)
+            {
+            case HTTP_UPDATE_FAILED:
+                lcd.clear();
+                lcd.setCursor(0,0);
+                lcd.print("Upload ERROR");
+                Serial.printf("HTTP_UPDATE_FAILED Error (%d): %s", ESPhttpUpdate.getLastError(),
+                ESPhttpUpdate.getLastErrorString().c_str());
+                ESP.restart();
+                break;
+            case HTTP_UPDATE_NO_UPDATES:
+                Serial.println("HTTP_UPDATE_NO_UPDATES");
+                ESP.restart();
+                break;
+            case HTTP_UPDATE_OK:
+                lcd.clear();
+                lcd.setCursor(0,0);
+                lcd.print("Upload Success");
+                Serial.println("HTTP_UPDATE_OK");
+            default:
+                break;
+            }
+        }
+        time_2=millis();
+       
+    }
+    
+}
+
+void getInfoUpdate()
+{
+    if (Firebase.ready())
+        {
+            if (Firebase.RTDB.getInt(&fbdo,"/Update"))
+            {
+                if (fbdo.dataType()=="int")
+                {
+                    if (fbdo.intData()==1)
+                    {
+                        updateCheck = fbdo.intData();
+                    }
+                    else
+                    {
+                        updateCheck = 0;
+                    }
+                }
+                                                   
+            }
+            
+        }
+}
+/* void getPM() //ham lay gia tri bụi
+{
+    PmResult pm= sds.readPm();
+    if(pm.isOk())
+    {
+        char pm25[5];
+        char pm10[5];
+        sprintf(pm25,"%.2f",pm.pm25);
+        sprintf(pm10,"%.2f",pm.pm10);
+        client.publish("CO2Measurement/PM2.5",pm25);
+        client.publish("CO2Measurement/PM2.5",pm10);
+        if(pm.pm25 >= 51)
+        {
+            digitalWrite(machinePin, HIGH);
+        }
+    }
+    else
+    {
+
+    }
+} */
