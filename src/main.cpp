@@ -32,27 +32,27 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-const char *ssid = "PTN-D906";                 // tên wifi
-const char *pass = "PTND0906";                 // mật khẩu wifi
+const char *ssid = "nhatrovn.vn CN31"; // tên wifi
+const char *pass = "nhatrovn.vn"; // mật khẩu wifi
 
 const char *mqtt_server = "broker.hivemq.com"; // server MQTT
 const int mqtt_port = 1883;                    // port server MQTT
 
-const String currentVersion = "2.0"; //version hiện tại của chương trình này
-const char *serverUrl = "http://robot-kambria.000webhostapp.com/bin"; //chứa file update
+const String currentVersion = "2.0";                                  // version hiện tại của chương trình này
+const char *serverUrl = "http://robot-kambria.000webhostapp.com/bin"; // chứa file update
 
-int stateManual;      // bien chế độ - 0: manual và 1 : auto
+int stateManual;      // bien chế độ - 1: manual và 0 : auto
 int stateLight = 0;   // bien đèn 1 - ON và 0 - OFF
 int stateMachine = 0; // bien quạt 1 - ON và 0 - OFF
 int valuePPM = 800;
-int valuePM25, valuePM10; //bien set ngưỡng bụi
-int updateCheck = 0; //biến trạng thái update OTA
-float pm;
+int valuePM25, valuePM10; // bien set ngưỡng bụi
+int updateCheck = 0;      // biến trạng thái update OTA
+float pmBui;
 
-String c; //biến mess của mqtt
-String strTopic; //biến topic mqtt
+String c;        // biến mess của mqtt
+String strTopic; // biến topic mqtt
 
-unsigned long time_1 = 0; //khởi tạo time đếm giây
+unsigned long time_1 = 0; // khởi tạo time đếm giây
 unsigned long time_2 = 0;
 
 void callback(char *topic, byte *payload, unsigned int length);
@@ -72,9 +72,9 @@ void setup()
 {
     Serial.begin(115200);
     pinMode(machinePin, OUTPUT);
-    pinMode(D3, INPUT);  // chân vào của cảm biến phát hiện chuyển động
+    //pinMode(D3, INPUT);  // chân vào của cảm biến phát hiện chuyển động
     pinMode(D5, OUTPUT); // chân ra đèn led
-    pinMode(D6, INPUT);  // chân vào DHT21
+    //pinMode(D6, INPUT);  // chân vào DHT21
     sds.begin();
     sds.setActiveReportingMode();
     sds.setContinuousWorkingPeriod();
@@ -86,10 +86,12 @@ void setup()
     client.subscribe("CO2Measurement/stateNow");
     client.subscribe("CO2Measurement/setPPMAuto");
     client.subscribe("CO2Measurement/setLight");
+    client.subscribe("CO2Measurement/setPM25Auto");
+    client.subscribe("CO2Measurement/setPM10Auto");
     pubStateNow(); // gửi dữ liệu lúc vừa mở system
 
     // firebase
-    config.api_key = FIREBASE_API;
+    /* config.api_key = FIREBASE_API;
     config.database_url = FIREBASE_HOST;
     if (Firebase.signUp(&config, &auth, "", ""))
     {
@@ -100,10 +102,7 @@ void setup()
         Serial.println("Login to firebase Failed");
     }
     Firebase.begin(&config, &auth);
-    Firebase.reconnectWiFi(true);
-
-    Serial.print("Rzero of MQ135: ");
-    Serial.println(mq135_sensor.getRZero());
+    Firebase.reconnectWiFi(true); */
 }
 void loop()
 {
@@ -113,15 +112,15 @@ void loop()
         char buffer[50];                               // tao bien buffer kieu mang ki tu de lam trung gian
         sprintf(buffer, "%d", getCO2());               // dua gia tri cua ham int getCO2 veo kieu chuoi buffer
         client.publish("CO2Measurement/Data", buffer); // pub data len mqtt broker
-        Serial.print(getCO2());
-        Serial.println();
+        //Serial.print(getCO2());
+        //Serial.println();
         pubStateNow();
+        Serial.print("Rzero of MQ135: ");
+        Serial.println(mq135_sensor.getRZero());
+        getPM();
         time_1 = millis();
     }
-    if ((unsigned long)(millis() - time_2) > 1000)
-    {
-        getPM(); 
-    }                                      // lấy giá trị bụi
+    // lấy giá trị bụi
     updateFirmware();
 }
 
@@ -234,23 +233,12 @@ void callback(char *topic, byte *payload, unsigned int length) // ham tra ve dat
     }
     if (strTopic == "CO2Measurement/setPM25Auto")
     {
-        valuePM25 = atoi((char*)payload);
+        valuePM25 = atoi((char *)payload);
     }
     if (strTopic == "CO2Measurement/setPM10Auto")
     {
         valuePM10 = atoi((char *)payload);
     }
-    /* if(strTopic=="CO2Measurement/setLight")
-    {
-        if(c=="1")
-        {
-            digitalWrite(D4,HIGH);
-        }
-        if(c=="0")
-        {
-            digitalWrite(D4,LOW);
-        }
-    } */
 }
 // hàm gửi trạng thái hiện tại
 void pubStateNow() // ham này khi mo len se gui du lieu len cloud
@@ -264,7 +252,7 @@ void pubStateNow() // ham này khi mo len se gui du lieu len cloud
     {
         client.publish("CO2Measurement/statusSensor", "1");
     }
-    if (pm <= 0)
+    if (pmBui <= 0)
     {
         client.publish("CO2Measurement/statusSensorBui", "0");
     }
@@ -365,48 +353,38 @@ void Auto() // che do tu dong
 {
     if (stateManual == 0)
     {
-        if (getCO2() >= valuePPM)
-        {
-            digitalWrite(machinePin, HIGH);
-            client.publish("CO2Measurement/statusMachine", "1");
-        }
-        else
-        {
-            digitalWrite(machinePin, LOW);
-            client.publish("CO2Measurement/statusMachine", "0");
-        }
+        
         controlLight();
         getPM();
-        /* PmResult pm = sds.readPm();
-        if (pm.isOk())
-        {
-            if (pm.pm25 >= 51)
-            {
-                digitalWrite(machinePin, HIGH);
-            }
-        } */
+        
     }
 }
 
 int getCO2() // ham tra ve gia tri CO2
 {
     float ppm;
-    //float t = 25.0; 
-    //float h = 60.0;
-     float t = dht.readTemperature();
-     float h = dht.readHumidity();
-     //hàm kiem tra 
+    // float t = 25.0;
+    // float h = 60.0;
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    // hàm kiem tra
     if (isnan(h) || isnan(t))
     {
-        client.publish("CO2Measurement/statusSensorDHT", "1");
+        t = 25.0;
+        h = 60.0;
+        ppm = mq135_sensor.getPPM();
+        client.publish("CO2Measurement/statusSensorDHT", "0");
     }
     else
     {
-        t = 25.0; 
-        h = 60.0;
-        client.publish("CO2Measurement/statusSensorDHT", "0");
+        ppm = mq135_sensor.getCorrectedPPM(t, h);
+        client.publish("CO2Measurement/statusSensorDHT", "1");
     }
-    ppm = mq135_sensor.getCorrectedPPM(t, h);
+    Serial.print("Nhiet do: ");
+    Serial.println(t);
+    Serial.print("Do am: ");
+    Serial.println(h);
+    
     return (int)ppm;
 }
 
@@ -416,11 +394,15 @@ void controlLight()
     if (digitalRead(D3) == 1)
     {
         digitalWrite(LightRelay, HIGH);
+        client.publish("CO2Measurement/statusLight", "1");
     }
     else
     {
         digitalWrite(LightRelay, LOW);
+        client.publish("CO2Measurement/statusLight", "1");
     }
+    Serial.print("move sensor: ");
+    Serial.println(digitalRead(D3));
 }
 
 void updateFirmware()
@@ -487,18 +469,20 @@ void getPM() // ham lay gia tri bụi
 
         client.publish("CO2Measurement/PM2.5", pm25);
         client.publish("CO2Measurement/PM10", pm10);
-        Serial.print("pm2.5: ");
-        Serial.println(pm.pm25);
-        Serial.print("pm10: ");
-        Serial.println(pm.pm10);
-        if (pm.pm25 >= valuePM25)
+
+        pmBui = pm.pm10;
+        if (stateManual == 0)
         {
-            digitalWrite(machinePin, HIGH);
-        }
-        if (pm.pm10 >= valuePM10)
-        {
-            digitalWrite(machinePin, HIGH);
+            if (pm.pm25 >= valuePM25 || pm.pm10 >= valuePM10 || getCO2()>= valuePPM)
+            {
+                digitalWrite(machinePin, HIGH);
+                client.publish("CO2Measurement/statusMachine", "1");
+            }
+            else
+            {
+                digitalWrite(machinePin, LOW);
+                client.publish("CO2Measurement/statusMachine", "0");
+            }
         }
     }
-    
 }
